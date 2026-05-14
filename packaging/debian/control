@@ -1,0 +1,12 @@
+Package: gpu-watch
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: gpu-watch
+Depends: bash, curl, python3, coreutils, procps
+Description: Reusable GPU pod training watcher with logs, ntfy alerts, GPU stats, and generic metrics
+ gpu-watch wraps any training or evaluation command and provides:
+ live terminal output, persistent timestamped logs, ntfy.sh push
+ notifications, GPU monitoring via nvidia-smi, and generic model
+ metric extraction from TensorBoard, CSV, JSON, or stdout.
