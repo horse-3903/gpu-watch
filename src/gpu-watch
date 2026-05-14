@@ -25,6 +25,10 @@ METRIC_KEYS=""
 METRIC_TOP_K=8
 GPU_ENABLED=true
 METRICS_ENABLED=true
+# shellcheck disable=SC2016  # intentional: $RUNPOD_POD_ID expands at run time
+POST_CMD='runpodctl stop pod $RUNPOD_POD_ID'
+POST_CMD_ENABLED=true
+POST_CMD_DELAY=1800   # seconds to wait after failure before running anyway (30 min)
 CMD=()
 
 FINAL_SENT=0
@@ -60,7 +64,16 @@ Optional:
   --metric-top-k N            Max metrics to show (default: 8)
   --no-gpu                    Disable GPU monitoring
   --no-metrics                Disable metric extraction
+  --post-cmd CMD              Command to run after training
+                              (default: runpodctl stop pod \$RUNPOD_POD_ID)
+  --no-post-cmd               Disable the post-training command
   --help                      Show this help
+
+Post-command behaviour:
+  On success  — runs immediately after training finishes
+  On failure  — waits 30 minutes so you can inspect the error,
+                then runs anyway; press Enter to run early or
+                type 'cancel' + Enter to skip it entirely
 
 Examples:
   gpu-watch --topic my-topic -- python train.py
@@ -71,6 +84,12 @@ Examples:
     --interval 10 \\
     --log-dir /workspace/logs \\
     -- python train.py --config config.yaml
+
+  # Custom shutdown command
+  gpu-watch --topic my-topic --post-cmd "shutdown -h now" -- python train.py
+
+  # Disable auto-shutdown
+  gpu-watch --topic my-topic --no-post-cmd -- python train.py
 EOF
 }
 
@@ -91,6 +110,8 @@ parse_args() {
             --metric-top-k)     METRIC_TOP_K="$2";       shift 2 ;;
             --no-gpu)           GPU_ENABLED=false;        shift ;;
             --no-metrics)       METRICS_ENABLED=false;    shift ;;
+            --post-cmd)         POST_CMD="$2";            shift 2 ;;
+            --no-post-cmd)      POST_CMD_ENABLED=false;   shift ;;
             --help|-h)          usage; exit 0 ;;
             --)                 shift; CMD=("$@"); break ;;
             *)
@@ -232,6 +253,96 @@ get_metrics() {
     fi
 
     python3 "$METRICS_SCRIPT" "${args[@]}" 2>/dev/null || echo "Metrics unavailable"
+}
+
+# ---------------------------------------------------------------------------
+# Post-training command
+# ---------------------------------------------------------------------------
+run_post_cmd() {
+    local exit_code="$1"
+
+    if [[ "$POST_CMD_ENABLED" != "true" ]]; then
+        return
+    fi
+
+    echo ""
+    echo "[gpu-watch] Post-command: ${POST_CMD}"
+
+    if [[ "$exit_code" -eq 0 ]]; then
+        echo "[gpu-watch] Training succeeded — running post-command now."
+        send_ntfy "[gpu-watch] Running post-command: ${RUN_NAME}" \
+            "Training succeeded. Running: ${POST_CMD}" "default"
+        bash -c "$POST_CMD"
+        return
+    fi
+
+    # Training failed — give the user a 30-minute window to interact
+    echo "[gpu-watch] Training FAILED (exit ${exit_code})."
+    echo "[gpu-watch] Post-command will run automatically in 30 minutes."
+    echo "[gpu-watch]   → Press Enter          to run it NOW"
+    echo "[gpu-watch]   → Type 'cancel' + Enter to SKIP it"
+    echo ""
+
+    send_ntfy "[gpu-watch] Waiting before post-command: ${RUN_NAME}" \
+        "Training failed (exit ${exit_code}). Post-command will run in 30 min:
+${POST_CMD}
+
+Reply in your terminal: Enter = run now, 'cancel' = skip." "high"
+
+    local remaining=$POST_CMD_DELAY
+    local user_input
+
+    # If stdin is not a terminal (e.g. piped / nohup), skip the interactive wait
+    if [[ ! -t 0 ]]; then
+        echo "[gpu-watch] stdin is not a terminal — waiting ${POST_CMD_DELAY}s silently."
+        sleep "$POST_CMD_DELAY"
+        echo "[gpu-watch] Timeout reached. Running post-command."
+        send_ntfy "[gpu-watch] Running post-command: ${RUN_NAME}" \
+            "30-min window elapsed. Running: ${POST_CMD}" "high"
+        bash -c "$POST_CMD"
+        return
+    fi
+
+    while (( remaining > 0 )); do
+        local mins=$(( remaining / 60 ))
+        local secs=$(( remaining % 60 ))
+
+        # Print a countdown line at meaningful intervals
+        if (( remaining == POST_CMD_DELAY ))      || \
+           (( remaining % 300 == 0 ))             || \
+           (( remaining <= 60 && remaining % 10 == 0 )); then
+            printf "[gpu-watch] Post-command in %02dm %02ds  (Enter=run now, 'cancel'=skip)\n" \
+                "$mins" "$secs"
+        fi
+
+        # Poll stdin with a 1-second timeout
+        if read -t 1 -r user_input 2>/dev/null; then
+            echo ""
+            case "${user_input,,}" in
+                cancel|skip|no|n)
+                    echo "[gpu-watch] Post-command cancelled by user."
+                    send_ntfy "[gpu-watch] Post-command skipped: ${RUN_NAME}" \
+                        "User cancelled the post-command." "default"
+                    return
+                    ;;
+                *)
+                    echo "[gpu-watch] Running post-command now (user request)."
+                    send_ntfy "[gpu-watch] Running post-command: ${RUN_NAME}" \
+                        "User triggered early run: ${POST_CMD}" "high"
+                    bash -c "$POST_CMD"
+                    return
+                    ;;
+            esac
+        fi
+
+        remaining=$(( remaining - 1 ))
+    done
+
+    echo ""
+    echo "[gpu-watch] 30-minute window elapsed. Running post-command."
+    send_ntfy "[gpu-watch] Running post-command: ${RUN_NAME}" \
+        "30-min window elapsed. Running: ${POST_CMD}" "high"
+    bash -c "$POST_CMD"
 }
 
 # ---------------------------------------------------------------------------
@@ -424,6 +535,7 @@ handle_sigint() {
     echo "[gpu-watch] Caught SIGINT — shutting down." >&2
     [[ -n "$CHILD_PID" ]] && kill -INT  "$CHILD_PID" 2>/dev/null || true
     [[ -n "$TEE_PID"   ]] && kill       "$TEE_PID"   2>/dev/null || true
+    POST_CMD_ENABLED=false   # don't run post-command on user interrupt
     FINAL_SENT=1
     local elapsed_fmt tail_lines msg
     elapsed_fmt="$(format_duration "$(elapsed_seconds)")"
@@ -444,6 +556,7 @@ handle_sigterm() {
     echo "[gpu-watch] Caught SIGTERM — Kubernetes shutdown?" >&2
     [[ -n "$CHILD_PID" ]] && kill -TERM "$CHILD_PID" 2>/dev/null || true
     [[ -n "$TEE_PID"   ]] && kill       "$TEE_PID"   2>/dev/null || true
+    POST_CMD_ENABLED=false   # pod is already being killed; skip post-command
     FINAL_SENT=1
     local elapsed_fmt tail_lines msg
     elapsed_fmt="$(format_duration "$(elapsed_seconds)")"
@@ -601,6 +714,7 @@ ${gpu_start_info}"
     } >> "$METRICS_LOG" 2>&1
 
     cleanup "$EXIT_CODE"
+    run_post_cmd "$EXIT_CODE"
     exit "$EXIT_CODE"
 }
 
