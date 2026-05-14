@@ -113,6 +113,8 @@ gpu-watch \
 | `--metric-top-k N` | `8` | Maximum number of metrics shown per update |
 | `--no-gpu` | *(off)* | Disable GPU monitoring |
 | `--no-metrics` | *(off)* | Disable metric extraction |
+| `--post-cmd CMD` | `runpodctl stop pod $RUNPOD_POD_ID` | Command to run after training |
+| `--no-post-cmd` | *(off)* | Disable the post-training command |
 
 ---
 
@@ -224,6 +226,40 @@ gpu-watch --topic mytopic --log-dir /workspace/logs -- python train.py
 ### SIGTERM handling
 
 Kubernetes sends SIGTERM before terminating a pod. `gpu-watch` catches this, sends an `INTERRUPTED (SIGTERM)` ntfy notification, writes the partial summary, and exits with code 143 — all before the pod is killed.
+
+---
+
+## Post-training command
+
+After training finishes, `gpu-watch` automatically runs a cleanup/shutdown command.
+
+| Outcome | Behaviour |
+|---------|-----------|
+| **Success** (exit 0) | Post-command runs immediately |
+| **Failure** (any other exit) | 30-minute interactive window — press **Enter** to run early, type **`cancel`** + Enter to skip entirely, or do nothing and it runs automatically when the timer hits |
+| **SIGINT / SIGTERM** | Post-command is skipped (pod is already being killed or user explicitly interrupted) |
+
+The default command stops a RunPod instance:
+
+```bash
+runpodctl stop pod $RUNPOD_POD_ID
+```
+
+`$RUNPOD_POD_ID` is resolved from the environment at run time — it's set automatically inside RunPod containers.
+
+**Override the command:**
+
+```bash
+gpu-watch --topic my-topic --post-cmd "shutdown -h now" -- python train.py
+```
+
+**Disable it entirely:**
+
+```bash
+gpu-watch --topic my-topic --no-post-cmd -- python train.py
+```
+
+A ntfy notification is sent when the post-command is about to run, and another when it fires (or is cancelled).
 
 ---
 
