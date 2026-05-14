@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+chmod 755 /usr/local/bin/gpu-watch
+chmod 755 /usr/local/bin/gpu_watch_metrics.py

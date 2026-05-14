@@ -1,0 +1,607 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# gpu-watch — wrap any training command with live logs, GPU stats, and ntfy
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+METRICS_SCRIPT="${SCRIPT_DIR}/gpu_watch_metrics.py"
+if [[ ! -f "$METRICS_SCRIPT" ]]; then
+    METRICS_SCRIPT="/usr/local/bin/gpu_watch_metrics.py"
+fi
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+TOPIC=""
+RUN_NAME=""
+INTERVAL=10
+METRIC_INTERVAL=5
+GPU_INTERVAL=60
+LOG_DIR="logs"
+METRICS_DIR="."
+METRIC_KEYS=""
+METRIC_TOP_K=8
+GPU_ENABLED=true
+METRICS_ENABLED=true
+CMD=()
+
+FINAL_SENT=0
+GPU_LOOP_PID=""
+STATUS_LOOP_PID=""
+TEE_PID=""
+FIFO=""
+CHILD_PID=""
+START_TIME=""
+RUN_DIR=""
+TRAIN_LOG=""
+GPU_LOG=""
+METRICS_LOG=""
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: gpu-watch --topic TOPIC [OPTIONS] -- COMMAND [ARGS...]
+
+Required:
+  --topic TOPIC               ntfy.sh topic name
+
+Optional:
+  --name NAME                 Run name (default: run-YYYYMMDD-HHMMSS)
+  --interval MINUTES          Periodic ntfy interval in minutes (default: 10)
+  --metric-interval MINUTES   Metric extraction interval in minutes (default: 5)
+  --gpu-interval SECONDS      GPU poll interval in seconds (default: 60)
+  --log-dir DIR               Log base directory (default: logs)
+  --metrics-dir DIR           Directory to search for metric files (default: .)
+  --metric-keys KEYS          Comma-separated metric keys to prefer
+  --metric-top-k N            Max metrics to show (default: 8)
+  --no-gpu                    Disable GPU monitoring
+  --no-metrics                Disable metric extraction
+  --help                      Show this help
+
+Examples:
+  gpu-watch --topic my-topic -- python train.py
+
+  gpu-watch \\
+    --topic my-topic \\
+    --name rtdetr-run1 \\
+    --interval 10 \\
+    --log-dir /workspace/logs \\
+    -- python train.py --config config.yaml
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --topic)            TOPIC="$2";              shift 2 ;;
+            --name)             RUN_NAME="$2";           shift 2 ;;
+            --interval)         INTERVAL="$2";           shift 2 ;;
+            --metric-interval)  METRIC_INTERVAL="$2";    shift 2 ;;
+            --gpu-interval)     GPU_INTERVAL="$2";       shift 2 ;;
+            --log-dir)          LOG_DIR="$2";            shift 2 ;;
+            --metrics-dir)      METRICS_DIR="$2";        shift 2 ;;
+            --metric-keys)      METRIC_KEYS="$2";        shift 2 ;;
+            --metric-top-k)     METRIC_TOP_K="$2";       shift 2 ;;
+            --no-gpu)           GPU_ENABLED=false;        shift ;;
+            --no-metrics)       METRICS_ENABLED=false;    shift ;;
+            --help|-h)          usage; exit 0 ;;
+            --)                 shift; CMD=("$@"); break ;;
+            *)
+                echo "ERROR: Unknown option: $1" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+validate_args() {
+    local errors=0
+
+    if [[ -z "$TOPIC" ]]; then
+        echo "ERROR: --topic is required." >&2
+        errors=1
+    fi
+
+    if [[ ${#CMD[@]} -eq 0 ]]; then
+        echo "ERROR: No command provided after --." >&2
+        errors=1
+    fi
+
+    if ! [[ "$INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: --interval must be a positive integer, got: $INTERVAL" >&2
+        errors=1
+    fi
+
+    if ! [[ "$METRIC_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: --metric-interval must be a positive integer, got: $METRIC_INTERVAL" >&2
+        errors=1
+    fi
+
+    if ! [[ "$GPU_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: --gpu-interval must be a positive integer, got: $GPU_INTERVAL" >&2
+        errors=1
+    fi
+
+    if ! [[ "$METRIC_TOP_K" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: --metric-top-k must be a positive integer, got: $METRIC_TOP_K" >&2
+        errors=1
+    fi
+
+    if [[ $errors -ne 0 ]]; then
+        echo "" >&2
+        usage >&2
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Timestamp helpers
+# ---------------------------------------------------------------------------
+now_ts()    { date '+%Y-%m-%d %H:%M:%S'; }
+now_file()  { date '+%Y%m%d_%H%M%S'; }
+elapsed_seconds() { echo $(( $(date +%s) - START_TIME )); }
+
+format_duration() {
+    local secs=$1
+    local h=$(( secs / 3600 ))
+    local m=$(( (secs % 3600) / 60 ))
+    local s=$(( secs % 60 ))
+    printf '%02dh %02dm %02ds' "$h" "$m" "$s"
+}
+
+# ---------------------------------------------------------------------------
+# ntfy notifications
+# ---------------------------------------------------------------------------
+send_ntfy() {
+    local title="$1"
+    local message="$2"
+    local priority="${3:-default}"
+
+    if ! command -v curl &>/dev/null; then
+        echo "[gpu-watch] WARNING: curl not found, skipping ntfy notification." >&2
+        return 0
+    fi
+
+    curl -s --max-time 10 \
+        -H "Title: ${title}" \
+        -H "Priority: ${priority}" \
+        -d "${message}" \
+        "https://ntfy.sh/${TOPIC}" \
+        >/dev/null 2>&1 || {
+        echo "[gpu-watch] WARNING: ntfy.sh notification failed (network issue?). Continuing." >&2
+    }
+}
+
+# ---------------------------------------------------------------------------
+# GPU helpers
+# ---------------------------------------------------------------------------
+get_gpu_summary() {
+    if [[ "$GPU_ENABLED" != "true" ]]; then
+        echo "GPU monitoring disabled"
+        return
+    fi
+    if ! command -v nvidia-smi &>/dev/null; then
+        echo "nvidia-smi not available"
+        return
+    fi
+    nvidia-smi \
+        --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
+        --format=csv,noheader,nounits 2>/dev/null \
+    | awk -F', ' '{
+        printf "%s: %s | util=%s%% | mem=%s/%s MiB | temp=%sC | power=%sW\n",
+               $1, $2, $3, $4, $5, $6, $7
+      }' \
+    || echo "GPU query failed"
+}
+
+# ---------------------------------------------------------------------------
+# Metric extraction
+# ---------------------------------------------------------------------------
+get_metrics() {
+    if [[ "$METRICS_ENABLED" != "true" ]]; then
+        echo "Metrics monitoring disabled"
+        return
+    fi
+    if ! command -v python3 &>/dev/null; then
+        echo "python3 not available"
+        return
+    fi
+    if [[ ! -f "$METRICS_SCRIPT" ]]; then
+        echo "gpu_watch_metrics.py not found"
+        return
+    fi
+
+    local args=(
+        --dir "$METRICS_DIR"
+        --top-k "$METRIC_TOP_K"
+        --since "$START_TIME"
+    )
+    if [[ -n "$TRAIN_LOG" && -f "$TRAIN_LOG" ]]; then
+        args+=(--train-log "$TRAIN_LOG")
+    fi
+    if [[ -n "$METRIC_KEYS" ]]; then
+        args+=(--keys "$METRIC_KEYS")
+    fi
+
+    python3 "$METRICS_SCRIPT" "${args[@]}" 2>/dev/null || echo "Metrics unavailable"
+}
+
+# ---------------------------------------------------------------------------
+# GPU logging loop (background)
+# ---------------------------------------------------------------------------
+gpu_loop() {
+    while true; do
+        sleep "$GPU_INTERVAL"
+        [[ -f "${RUN_DIR}/.running" ]] || break
+        {
+            echo "--- $(now_ts) ---"
+            get_gpu_summary
+            echo ""
+        } >> "$GPU_LOG" 2>&1
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Status / ntfy loop (background)
+# ---------------------------------------------------------------------------
+status_loop() {
+    local next_ntfy=$(( INTERVAL * 60 ))
+    local next_metric=$(( METRIC_INTERVAL * 60 ))
+    local elapsed
+    local tick=30  # resolution: every 30 s
+
+    while true; do
+        sleep "$tick"
+        [[ -f "${RUN_DIR}/.running" ]] || break
+
+        elapsed=$(elapsed_seconds)
+
+        if (( elapsed >= next_metric )); then
+            {
+                echo "--- $(now_ts) ---"
+                get_metrics
+                echo ""
+            } >> "$METRICS_LOG" 2>&1
+            next_metric=$(( elapsed + METRIC_INTERVAL * 60 ))
+        fi
+
+        if (( elapsed >= next_ntfy )); then
+            local gpu_info elapsed_fmt latest_metrics tail_lines msg
+            gpu_info="$(get_gpu_summary)"
+            elapsed_fmt="$(format_duration "$elapsed")"
+            latest_metrics="$(get_metrics)"
+            tail_lines="$(tail -n 10 "$TRAIN_LOG" 2>/dev/null || true)"
+
+            msg="Run: ${RUN_NAME}
+Elapsed: ${elapsed_fmt}
+
+GPU:
+${gpu_info}
+
+Metrics:
+${latest_metrics}
+
+Recent output:
+${tail_lines}"
+            send_ntfy "[gpu-watch] ${RUN_NAME} still running" "$msg" "default"
+            next_ntfy=$(( elapsed + INTERVAL * 60 ))
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Stop background loops
+# ---------------------------------------------------------------------------
+stop_loops() {
+    rm -f "${RUN_DIR}/.running" 2>/dev/null || true
+    if [[ -n "$GPU_LOOP_PID" ]]; then
+        kill "$GPU_LOOP_PID"    2>/dev/null || true
+        wait "$GPU_LOOP_PID"    2>/dev/null || true
+        GPU_LOOP_PID=""
+    fi
+    if [[ -n "$STATUS_LOOP_PID" ]]; then
+        kill "$STATUS_LOOP_PID" 2>/dev/null || true
+        wait "$STATUS_LOOP_PID" 2>/dev/null || true
+        STATUS_LOOP_PID=""
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup / signal handlers
+# ---------------------------------------------------------------------------
+cleanup() {
+    local exit_code="${1:-0}"
+    local reason="${2:-}"
+
+    stop_loops
+
+    # Save end-of-run artifacts (best effort)
+    local end_ts elapsed_secs elapsed_fmt
+    end_ts="$(now_ts)"
+    elapsed_secs=$(elapsed_seconds)
+    elapsed_fmt="$(format_duration "$elapsed_secs")"
+
+    command -v nvidia-smi &>/dev/null && \
+        nvidia-smi > "${RUN_DIR}/nvidia_smi_end.txt" 2>&1 || true
+    df -h  > "${RUN_DIR}/disk_end.txt"   2>/dev/null || true
+    command -v free &>/dev/null && \
+        free -h > "${RUN_DIR}/memory_end.txt" 2>/dev/null || true
+
+    echo "$exit_code" > "${RUN_DIR}/exit_code.txt"
+
+    local start_readable
+    start_readable="$(date -d "@${START_TIME}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+        || date -r "$START_TIME" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+        || echo "N/A")"
+
+    cat > "${RUN_DIR}/summary.txt" <<EOF
+Run Name:          ${RUN_NAME}
+Start Time:        ${start_readable}
+End Time:          ${end_ts}
+Duration:          ${elapsed_fmt}
+Exit Code:         ${exit_code}
+Command:           ${CMD[*]}
+Hostname:          $(hostname 2>/dev/null || echo "unknown")
+Working Directory: $(pwd)
+GPU Enabled:       ${GPU_ENABLED}
+Metrics Enabled:   ${METRICS_ENABLED}
+Log Directory:     ${RUN_DIR}
+EOF
+
+    if [[ "$FINAL_SENT" -eq 0 ]]; then
+        FINAL_SENT=1
+        local final_metrics final_gpu tail_lines msg
+
+        final_metrics="$(get_metrics)"
+        final_gpu="$(get_gpu_summary)"
+
+        if [[ -n "$reason" ]]; then
+            tail_lines="$(tail -n 20 "$TRAIN_LOG" 2>/dev/null || true)"
+            msg="Run: ${RUN_NAME}
+Elapsed: ${elapsed_fmt}
+Reason: ${reason}
+
+GPU:
+${final_gpu}
+
+Metrics:
+${final_metrics}
+
+Last output:
+${tail_lines}"
+            send_ntfy "[gpu-watch] INTERRUPTED: ${RUN_NAME}" "$msg" "high"
+
+        elif [[ "$exit_code" -eq 0 ]]; then
+            tail_lines="$(tail -n 10 "$TRAIN_LOG" 2>/dev/null || true)"
+            msg="Run: ${RUN_NAME}
+Duration: ${elapsed_fmt}
+Exit code: ${exit_code}
+
+GPU:
+${final_gpu}
+
+Final metrics:
+${final_metrics}
+
+Last output:
+${tail_lines}"
+            send_ntfy "[gpu-watch] SUCCESS: ${RUN_NAME}" "$msg" "high"
+
+        else
+            tail_lines="$(tail -n 40 "$TRAIN_LOG" 2>/dev/null || true)"
+            msg="Run: ${RUN_NAME}
+Duration: ${elapsed_fmt}
+Exit code: ${exit_code}
+
+GPU:
+${final_gpu}
+
+Final metrics:
+${final_metrics}
+
+Last output:
+${tail_lines}"
+            send_ntfy "[gpu-watch] FAILED (exit ${exit_code}): ${RUN_NAME}" "$msg" "urgent"
+        fi
+    fi
+
+    # Cleanup FIFO
+    [[ -n "$FIFO" && -p "$FIFO" ]] && rm -f "$FIFO" 2>/dev/null || true
+
+    echo "[gpu-watch] Run complete. Duration: ${elapsed_fmt} | Exit: ${exit_code} | Logs: ${RUN_DIR}"
+}
+
+handle_sigint() {
+    echo "" >&2
+    echo "[gpu-watch] Caught SIGINT — shutting down." >&2
+    [[ -n "$CHILD_PID" ]] && kill -INT  "$CHILD_PID" 2>/dev/null || true
+    [[ -n "$TEE_PID"   ]] && kill       "$TEE_PID"   2>/dev/null || true
+    FINAL_SENT=1
+    local elapsed_fmt tail_lines msg
+    elapsed_fmt="$(format_duration "$(elapsed_seconds)")"
+    tail_lines="$(tail -n 20 "$TRAIN_LOG" 2>/dev/null || true)"
+    msg="Run: ${RUN_NAME}
+Elapsed: ${elapsed_fmt}
+Reason: SIGINT (user interrupt)
+
+Last output:
+${tail_lines}"
+    send_ntfy "[gpu-watch] INTERRUPTED: ${RUN_NAME}" "$msg" "high"
+    cleanup 130
+    exit 130
+}
+
+handle_sigterm() {
+    echo "" >&2
+    echo "[gpu-watch] Caught SIGTERM — Kubernetes shutdown?" >&2
+    [[ -n "$CHILD_PID" ]] && kill -TERM "$CHILD_PID" 2>/dev/null || true
+    [[ -n "$TEE_PID"   ]] && kill       "$TEE_PID"   2>/dev/null || true
+    FINAL_SENT=1
+    local elapsed_fmt tail_lines msg
+    elapsed_fmt="$(format_duration "$(elapsed_seconds)")"
+    tail_lines="$(tail -n 20 "$TRAIN_LOG" 2>/dev/null || true)"
+    msg="Run: ${RUN_NAME}
+Elapsed: ${elapsed_fmt}
+Reason: SIGTERM (pod termination / Kubernetes eviction)
+
+Last output:
+${tail_lines}"
+    send_ntfy "[gpu-watch] TERMINATED: ${RUN_NAME}" "$msg" "urgent"
+    cleanup 143
+    exit 143
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+    parse_args "$@"
+    validate_args
+
+    if [[ -z "$RUN_NAME" ]]; then
+        RUN_NAME="run-$(date '+%Y%m%d-%H%M%S')"
+    fi
+
+    RUN_DIR="${LOG_DIR}/${RUN_NAME}_$(now_file)"
+    if ! mkdir -p "$RUN_DIR"; then
+        echo "ERROR: Cannot create log directory: ${RUN_DIR}" >&2
+        exit 1
+    fi
+
+    TRAIN_LOG="${RUN_DIR}/train.log"
+    GPU_LOG="${RUN_DIR}/gpu.log"
+    METRICS_LOG="${RUN_DIR}/metrics.log"
+
+    START_TIME=$(date +%s)
+    touch "${RUN_DIR}/.running"
+
+    # Auto-disable GPU if nvidia-smi missing
+    if [[ "$GPU_ENABLED" == "true" ]] && ! command -v nvidia-smi &>/dev/null; then
+        echo "[gpu-watch] WARNING: nvidia-smi not found. Disabling GPU monitoring." >&2
+        GPU_ENABLED=false
+    fi
+
+    # Auto-disable metrics if python3 or script missing
+    if [[ "$METRICS_ENABLED" == "true" ]]; then
+        if ! command -v python3 &>/dev/null; then
+            echo "[gpu-watch] WARNING: python3 not found. Disabling metric monitoring." >&2
+            METRICS_ENABLED=false
+        elif [[ ! -f "$METRICS_SCRIPT" ]]; then
+            echo "[gpu-watch] WARNING: gpu_watch_metrics.py not found. Disabling metric monitoring." >&2
+            METRICS_ENABLED=false
+        fi
+    fi
+
+    # Save environment info
+    {
+        echo "Hostname:     $(hostname 2>/dev/null || echo unknown)"
+        echo "User:         $(id -un 2>/dev/null || echo unknown)"
+        echo "Working Dir:  $(pwd)"
+        echo "Shell:        ${SHELL:-unknown}"
+        echo "PATH:         ${PATH:-unknown}"
+        echo ""
+        echo "Python:       $(python3 --version 2>&1 || echo 'not available')"
+        echo "pip:          $(python3 -m pip --version 2>&1 || echo 'not available')"
+        echo ""
+        for var in CUDA_VISIBLE_DEVICES NVIDIA_VISIBLE_DEVICES NVIDIA_DRIVER_CAPABILITIES \
+                   POD_NAME POD_NAMESPACE NODE_NAME; do
+            echo "${var}:   ${!var:-not set}"
+        done
+    } > "${RUN_DIR}/environment.txt"
+
+    echo "${CMD[*]}" > "${RUN_DIR}/command.txt"
+
+    command -v nvidia-smi &>/dev/null && \
+        nvidia-smi > "${RUN_DIR}/nvidia_smi_start.txt" 2>&1 || true
+    df -h  > "${RUN_DIR}/disk_start.txt"   2>/dev/null || true
+    command -v free &>/dev/null && \
+        free -h > "${RUN_DIR}/memory_start.txt" 2>/dev/null || true
+
+    # pip freeze — run in background so it doesn't block startup
+    (python3 -m pip freeze > "${RUN_DIR}/pip_freeze.txt" 2>/dev/null || true) &
+
+    # Install signal handlers before starting anything
+    trap handle_sigint  SIGINT
+    trap handle_sigterm SIGTERM
+
+    # Start notification
+    local gpu_start_info start_msg
+    gpu_start_info="$(get_gpu_summary)"
+    start_msg="Run: ${RUN_NAME}
+Command: ${CMD[*]}
+Host: $(hostname 2>/dev/null || echo unknown)${POD_NAME:+ / pod=$POD_NAME}
+Dir: $(pwd)
+Logs: ${RUN_DIR}
+
+GPU:
+${gpu_start_info}"
+    send_ntfy "[gpu-watch] STARTED: ${RUN_NAME}" "$start_msg" "default"
+
+    echo "[gpu-watch] Starting run: ${RUN_NAME}"
+    echo "[gpu-watch] Logs: ${RUN_DIR}"
+    echo "[gpu-watch] Command: ${CMD[*]}"
+    echo "[gpu-watch] GPU enabled: ${GPU_ENABLED} | Metrics enabled: ${METRICS_ENABLED}"
+    echo "[gpu-watch] ntfy topic: ${TOPIC}"
+    echo "---"
+
+    # Start background loops
+    if [[ "$GPU_ENABLED" == "true" ]]; then
+        gpu_loop &
+        GPU_LOOP_PID=$!
+    fi
+
+    status_loop &
+    STATUS_LOOP_PID=$!
+
+    # ---------------------------------------------------------------------------
+    # Run the wrapped command
+    #
+    # Use a named FIFO so we can:
+    #   1. Track the real child PID (needed to forward SIGTERM in Kubernetes)
+    #   2. Capture the exact exit code with PIPESTATUS-free accounting
+    #   3. Stream output live to terminal AND log via tee
+    # ---------------------------------------------------------------------------
+    FIFO="${RUN_DIR}/.train_fifo"
+    mkfifo "$FIFO"
+
+    # tee reads from the FIFO — writes to terminal and log simultaneously
+    tee -a "$TRAIN_LOG" < "$FIFO" &
+    TEE_PID=$!
+
+    set +e
+    "${CMD[@]}" > "$FIFO" 2>&1 &
+    CHILD_PID=$!
+    wait "$CHILD_PID"
+    EXIT_CODE=$?
+    set -e
+
+    CHILD_PID=""
+
+    # Close FIFO write end so tee sees EOF and exits
+    rm -f "$FIFO"
+    FIFO=""
+    wait "$TEE_PID" 2>/dev/null || true
+    TEE_PID=""
+
+    stop_loops
+
+    # Final metric snapshot
+    {
+        echo "--- $(now_ts) [final] ---"
+        get_metrics
+        echo ""
+    } >> "$METRICS_LOG" 2>&1
+
+    cleanup "$EXIT_CODE"
+    exit "$EXIT_CODE"
+}
+
+main "$@"
