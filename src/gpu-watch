@@ -72,7 +72,7 @@ Optional:
 Post-command behaviour:
   On success  — runs immediately after training finishes
   On failure  — waits 30 minutes so you can inspect the error,
-                then runs anyway; press Enter to run early or
+                then runs anyway; type 'run' + Enter to run early or
                 type 'cancel' + Enter to skip it entirely
 
 Examples:
@@ -279,7 +279,7 @@ run_post_cmd() {
     # Training failed — give the user a 30-minute window to interact
     echo "[gpu-watch] Training FAILED (exit ${exit_code})."
     echo "[gpu-watch] Post-command will run automatically in 30 minutes."
-    echo "[gpu-watch]   → Press Enter          to run it NOW"
+    echo "[gpu-watch]   → Type 'run' + Enter    to run it NOW"
     echo "[gpu-watch]   → Type 'cancel' + Enter to SKIP it"
     echo ""
 
@@ -287,7 +287,7 @@ run_post_cmd() {
         "Training failed (exit ${exit_code}). Post-command will run in 30 min:
 ${POST_CMD}
 
-Reply in your terminal: Enter = run now, 'cancel' = skip." "high"
+Reply in your terminal: 'run' = run now, 'cancel' = skip." "high"
 
     local remaining=$POST_CMD_DELAY
     local user_input
@@ -311,7 +311,7 @@ Reply in your terminal: Enter = run now, 'cancel' = skip." "high"
         if (( remaining == POST_CMD_DELAY ))      || \
            (( remaining % 300 == 0 ))             || \
            (( remaining <= 60 && remaining % 10 == 0 )); then
-            printf "[gpu-watch] Post-command in %02dm %02ds  (Enter=run now, 'cancel'=skip)\n" \
+            printf "[gpu-watch] Post-command in %02dm %02ds  ('run'=run now, 'cancel'=skip)\n" \
                 "$mins" "$secs"
         fi
 
@@ -325,12 +325,16 @@ Reply in your terminal: Enter = run now, 'cancel' = skip." "high"
                         "User cancelled the post-command." "default"
                     return
                     ;;
-                *)
+                run|yes|y)
                     echo "[gpu-watch] Running post-command now (user request)."
                     send_ntfy "[gpu-watch] Running post-command: ${RUN_NAME}" \
                         "User triggered early run: ${POST_CMD}" "high"
                     bash -c "$POST_CMD"
                     return
+                    ;;
+                *)
+                    printf "[gpu-watch] Unknown input '%s'. Type 'run' to run now or 'cancel' to skip.\n" \
+                        "$user_input"
                     ;;
             esac
         fi
