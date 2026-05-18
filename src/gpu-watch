@@ -578,12 +578,85 @@ status_loop() {
     local elapsed
     local tick=30  # resolution: every 30 s
 
+    # Always tail the combined log — works for both single-command and multi-phase
+    # modes (TRAIN_LOG changes per-phase in the parent but isn't visible here).
+    local combined_log="${RUN_DIR}/train.log"
+
+    # Track stage transitions so we can fire immediate ntfy on each stage change.
+    # Patterns emitted by the training scripts (all three models use the same format):
+    #   start  → "Stage N/total: stage_name"
+    #   finish → "Finished stage N: stage_name (Xs)"
+    #          → "Interrupted stage N: stage_name (Xs)"
+    local last_stage_start=""
+    local last_stage_finish=""
+
     while true; do
         sleep "$tick"
         [[ -f "${RUN_DIR}/.running" ]] || break
 
         elapsed=$(elapsed_seconds)
 
+        # ── Training-stage transition detection ───────────────────────────────
+        if [[ -f "$combined_log" ]]; then
+            # ── Stage started ─────────────────────────────────────────────────
+            local cur_stage
+            cur_stage="$(grep -E '^Stage [0-9]+/[0-9]+:' "$combined_log" 2>/dev/null \
+                | tail -1 || true)"
+
+            if [[ -n "$cur_stage" && "$cur_stage" != "$last_stage_start" ]]; then
+                last_stage_start="$cur_stage"
+                local stage_detail gpu_snap elapsed_fmt phase_ctx
+
+                # Grab the config lines that follow the header (freeze, epochs, lr0, …)
+                # Skip the header itself (tail -n +2) and the surrounding === lines.
+                stage_detail="$(grep -A 6 -F "$cur_stage" "$combined_log" 2>/dev/null \
+                    | tail -n +2 \
+                    | grep -vE '^[[:space:]]*=+[[:space:]]*$' \
+                    | grep -v '^[[:space:]]*$' \
+                    | head -5 || true)"
+
+                gpu_snap="$(get_gpu_summary)"
+                elapsed_fmt="$(format_duration "$elapsed")"
+
+                # In multi-phase runs include the enclosing phase name for context
+                phase_ctx="$(grep -E '^ Phase [0-9]+/[0-9]+:' "$combined_log" 2>/dev/null \
+                    | tail -1 | sed 's/^[[:space:]]*//' || true)"
+                [[ -n "$phase_ctx" ]] && phase_ctx="${phase_ctx} → "
+
+                send_ntfy "[gpu-watch] Stage started — ${RUN_NAME}" \
+"${phase_ctx}${cur_stage}
+${stage_detail}
+GPU:
+${gpu_snap}
+Elapsed: ${elapsed_fmt} | Run: ${RUN_NAME}" "default"
+            fi
+
+            # ── Stage finished ────────────────────────────────────────────────
+            local cur_finish
+            cur_finish="$(grep -E '^(Finished|Interrupted) stage [0-9]+:' \
+                "$combined_log" 2>/dev/null | tail -1 || true)"
+
+            if [[ -n "$cur_finish" && "$cur_finish" != "$last_stage_finish" ]]; then
+                last_stage_finish="$cur_finish"
+                local stage_metrics gpu_snap elapsed_fmt
+
+                stage_metrics="$(get_metrics)"
+                gpu_snap="$(get_gpu_summary)"
+                elapsed_fmt="$(format_duration "$elapsed")"
+
+                send_ntfy "[gpu-watch] Stage done — ${RUN_NAME}" \
+"${cur_finish}
+
+Metrics:
+${stage_metrics}
+
+GPU:
+${gpu_snap}
+Elapsed: ${elapsed_fmt} | Run: ${RUN_NAME}" "default"
+            fi
+        fi
+
+        # ── Metric snapshot ───────────────────────────────────────────────────
         if (( elapsed >= next_metric )); then
             {
                 echo "--- $(now_ts) ---"
@@ -593,15 +666,21 @@ status_loop() {
             next_metric=$(( elapsed + METRIC_INTERVAL * 60 ))
         fi
 
+        # ── Periodic ntfy ─────────────────────────────────────────────────────
         if (( elapsed >= next_ntfy )); then
-            local gpu_info elapsed_fmt latest_metrics tail_lines msg
+            local gpu_info elapsed_fmt latest_metrics tail_lines msg stage_line
             gpu_info="$(get_gpu_summary)"
             elapsed_fmt="$(format_duration "$elapsed")"
             latest_metrics="$(get_metrics)"
-            tail_lines="$(tail -n 10 "$TRAIN_LOG" 2>/dev/null || true)"
+            tail_lines="$(tail -n 10 "$combined_log" 2>/dev/null || true)"
+
+            # Include current stage if one has been detected
+            stage_line=""
+            [[ -n "$last_stage_start" ]] && stage_line="
+Stage: ${last_stage_start}"
 
             msg="Run: ${RUN_NAME}
-Elapsed: ${elapsed_fmt}
+Elapsed: ${elapsed_fmt}${stage_line}
 
 GPU:
 ${gpu_info}
@@ -759,7 +838,7 @@ handle_sigint() {
     FINAL_SENT=1
     local elapsed_fmt tail_lines msg
     elapsed_fmt="$(format_duration "$(elapsed_seconds)")"
-    tail_lines="$(tail -n 20 "$TRAIN_LOG" 2>/dev/null || true)"
+    tail_lines="$(tail -n 20 "${RUN_DIR}/train.log" 2>/dev/null || true)"
     msg="Run: ${RUN_NAME}
 Elapsed: ${elapsed_fmt}
 Reason: SIGINT (user interrupt)
@@ -780,7 +859,7 @@ handle_sigterm() {
     FINAL_SENT=1
     local elapsed_fmt tail_lines msg
     elapsed_fmt="$(format_duration "$(elapsed_seconds)")"
-    tail_lines="$(tail -n 20 "$TRAIN_LOG" 2>/dev/null || true)"
+    tail_lines="$(tail -n 20 "${RUN_DIR}/train.log" 2>/dev/null || true)"
     msg="Run: ${RUN_NAME}
 Elapsed: ${elapsed_fmt}
 Reason: SIGTERM (pod termination / Kubernetes eviction)
