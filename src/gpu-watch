@@ -30,6 +30,9 @@ POST_CMD='runpodctl stop pod $RUNPOD_POD_ID'
 POST_CMD_ENABLED=true
 POST_CMD_DELAY=1800   # seconds to wait after failure before running anyway (30 min)
 CMD=()
+PHASES_FILE=""
+PHASE_CMDS=()   # per-phase command strings (bash -c compatible)
+PHASE_NAMES=()  # per-phase display names
 
 FINAL_SENT=0
 GPU_LOOP_PID=""
@@ -49,6 +52,8 @@ METRICS_LOG=""
 usage() {
     cat <<EOF
 Usage: gpu-watch --topic TOPIC [OPTIONS] -- COMMAND [ARGS...]
+       gpu-watch --topic TOPIC [OPTIONS] --phase NAME CMD [--phase NAME CMD ...]
+       gpu-watch --topic TOPIC [OPTIONS] --phases FILE
 
 Required:
   --topic TOPIC               ntfy.sh topic name
@@ -64,26 +69,49 @@ Optional:
   --metric-top-k N            Max metrics to show (default: 8)
   --no-gpu                    Disable GPU monitoring
   --no-metrics                Disable metric extraction
-  --post-cmd CMD              Command to run after training
+  --post-cmd CMD              Command to run after all training finishes
                               (default: runpodctl stop pod \$RUNPOD_POD_ID)
   --no-post-cmd               Disable the post-training command
   --help                      Show this help
 
+Multi-phase training:
+  --phase NAME CMD            Add a named training phase. CMD is a shell string
+                              passed to bash -c. Phases run sequentially; the
+                              first failure stops remaining phases. Repeat to
+                              define multiple phases.
+
+  --phases FILE               Load phases from a file. Each non-empty,
+                              non-comment line is a command. Precede a command
+                              with a [name] header to set its display name.
+
+  Each phase gets its own log file (train_phaseN_NAME.log) plus per-phase
+  ntfy notifications on start, success, and failure. A combined train.log
+  aggregates all output.
+
 Post-command behaviour:
-  On success  — runs immediately after training finishes
+  On success  — runs immediately after all phases finish
   On failure  — waits 30 minutes so you can inspect the error,
                 then runs anyway; type 'run' + Enter to run early or
                 type 'cancel' + Enter to skip it entirely
 
 Examples:
+  # Single command (existing behaviour)
   gpu-watch --topic my-topic -- python train.py
 
-  gpu-watch \\
-    --topic my-topic \\
-    --name rtdetr-run1 \\
-    --interval 10 \\
-    --log-dir /workspace/logs \\
-    -- python train.py --config config.yaml
+  # Multiple phases (inline)
+  gpu-watch --topic my-topic --name seq-run \\
+    --phase rfdetr "python train/train_rfdetr.py --config config/rfdetr.yaml" \\
+    --phase rtdetr "python train/train_rtdetr.py --config config/rtdetr.yaml" \\
+    --phase yolo   "python train/train_yolo.py   --config config/yolo.yaml"
+
+  # Multiple phases (from file)
+  gpu-watch --topic my-topic --name seq-run --phases phases.txt
+
+  # phases.txt format:
+  #   [rfdetr]
+  #   python train/train_rfdetr.py --config config/rfdetr.yaml
+  #   [rtdetr]
+  #   python train/train_rtdetr.py --config config/rtdetr.yaml
 
   # Custom shutdown command
   gpu-watch --topic my-topic --post-cmd "shutdown -h now" -- python train.py
@@ -112,6 +140,12 @@ parse_args() {
             --no-metrics)       METRICS_ENABLED=false;    shift ;;
             --post-cmd)         POST_CMD="$2";            shift 2 ;;
             --no-post-cmd)      POST_CMD_ENABLED=false;   shift ;;
+            --phase)
+                PHASE_NAMES+=("$2")
+                PHASE_CMDS+=("$3")
+                shift 3
+                ;;
+            --phases)           PHASES_FILE="$2";         shift 2 ;;
             --help|-h)          usage; exit 0 ;;
             --)                 shift; CMD=("$@"); break ;;
             *)
@@ -131,8 +165,23 @@ validate_args() {
         errors=1
     fi
 
-    if [[ ${#CMD[@]} -eq 0 ]]; then
-        echo "ERROR: No command provided after --." >&2
+    # Require exactly one of: -- CMD, --phase, or --phases
+    local has_cmd=0 has_phases=0
+    [[ ${#CMD[@]} -gt 0 ]] && has_cmd=1
+    [[ ${#PHASE_CMDS[@]} -gt 0 || -n "$PHASES_FILE" ]] && has_phases=1
+
+    if [[ $has_cmd -eq 0 && $has_phases -eq 0 ]]; then
+        echo "ERROR: No command provided. Use '-- CMD', '--phase NAME CMD', or '--phases FILE'." >&2
+        errors=1
+    fi
+
+    if [[ $has_cmd -eq 1 && $has_phases -eq 1 ]]; then
+        echo "ERROR: Cannot mix '-- CMD' with '--phase' / '--phases'." >&2
+        errors=1
+    fi
+
+    if [[ -n "$PHASES_FILE" && ! -f "$PHASES_FILE" ]]; then
+        echo "ERROR: Phases file not found: $PHASES_FILE" >&2
         errors=1
     fi
 
@@ -253,6 +302,162 @@ get_metrics() {
     fi
 
     python3 "$METRICS_SCRIPT" "${args[@]}" 2>/dev/null || echo "Metrics unavailable"
+}
+
+# ---------------------------------------------------------------------------
+# Multi-phase support
+# ---------------------------------------------------------------------------
+
+# Parse a phases file into PHASE_NAMES / PHASE_CMDS.
+# File format:
+#   # comment lines are ignored
+#   [phase-name]          ← optional name header; auto-names if omitted
+#   bash command string   ← one command per section
+load_phases_file() {
+    local file="$1"
+    local pending_name=""
+    local auto_num=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip blank lines and comments
+        [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
+        # [name] header
+        if [[ "$line" =~ ^\[([^]]+)\]$ ]]; then
+            pending_name="${BASH_REMATCH[1]}"
+            continue
+        fi
+        # Command line
+        auto_num=$(( auto_num + 1 ))
+        PHASE_CMDS+=("$line")
+        if [[ -n "$pending_name" ]]; then
+            PHASE_NAMES+=("$pending_name")
+            pending_name=""
+        else
+            PHASE_NAMES+=("phase${auto_num}")
+        fi
+    done < "$file"
+
+    if [[ ${#PHASE_CMDS[@]} -eq 0 ]]; then
+        echo "ERROR: No phases found in: $file" >&2
+        exit 1
+    fi
+}
+
+# Run a single phase; updates globals TRAIN_LOG, FIFO, TEE_PID, CHILD_PID.
+# Returns the phase exit code.
+run_phase() {
+    local phase_num="$1"    # 1-based
+    local total="$2"
+    local name="$3"
+    local cmd="$4"
+    local phase_log="${RUN_DIR}/train_phase${phase_num}_${name}.log"
+    local combined_log="${RUN_DIR}/train.log"
+    local phase_start
+    phase_start=$(date +%s)
+
+    echo ""
+    echo "[gpu-watch] ── Phase ${phase_num}/${total}: ${name} ──"
+    echo "[gpu-watch] Command: ${cmd}"
+    echo "---"
+
+    # Header written to both the combined log and the per-phase log
+    {
+        echo ""
+        echo "============================================================"
+        printf ' Phase %d/%d: %s\n' "$phase_num" "$total" "$name"
+        echo " Command: ${cmd}"
+        echo " Started: $(now_ts)"
+        echo "============================================================"
+        echo ""
+    } | tee -a "$combined_log" >> "$phase_log"
+
+    # Point TRAIN_LOG at this phase so status_loop / metrics see live output
+    TRAIN_LOG="$phase_log"
+
+    send_ntfy "[gpu-watch] Phase ${phase_num}/${total} started: ${name} — ${RUN_NAME}" \
+        "Phase ${phase_num}/${total}: ${name}
+Command: ${cmd}
+
+Run: ${RUN_NAME}" "default"
+
+    # FIFO approach (mirrors single-command mode; globals updated for signal handlers)
+    FIFO="${RUN_DIR}/.phase${phase_num}_fifo"
+    mkfifo "$FIFO"
+
+    tee -a "$combined_log" -a "$phase_log" < "$FIFO" &
+    TEE_PID=$!
+
+    set +e
+    bash -c "$cmd" > "$FIFO" 2>&1 &
+    CHILD_PID=$!
+    wait "$CHILD_PID"
+    local phase_exit=$?
+    set -e
+
+    CHILD_PID=""
+    rm -f "$FIFO"
+    FIFO=""
+    wait "$TEE_PID" 2>/dev/null || true
+    TEE_PID=""
+
+    local phase_elapsed=$(( $(date +%s) - phase_start ))
+    local phase_elapsed_fmt
+    phase_elapsed_fmt="$(format_duration "$phase_elapsed")"
+
+    # Footer
+    {
+        echo ""
+        echo "============================================================"
+        printf ' Phase %d/%d: %s — EXIT %d — %s\n' \
+            "$phase_num" "$total" "$name" "$phase_exit" "$phase_elapsed_fmt"
+        echo "============================================================"
+    } | tee -a "$combined_log" >> "$phase_log"
+
+    if [[ "$phase_exit" -eq 0 ]]; then
+        echo "[gpu-watch] Phase ${phase_num}/${total} (${name}) succeeded in ${phase_elapsed_fmt}."
+        local phase_metrics
+        phase_metrics="$(get_metrics)"
+        send_ntfy "[gpu-watch] Phase ${phase_num}/${total} done: ${name} — ${RUN_NAME}" \
+            "Phase ${phase_num}/${total}: ${name} SUCCESS
+Duration: ${phase_elapsed_fmt}
+
+Metrics:
+${phase_metrics}
+
+Run: ${RUN_NAME}" "default"
+    else
+        echo "[gpu-watch] Phase ${phase_num}/${total} (${name}) FAILED (exit ${phase_exit}) after ${phase_elapsed_fmt}."
+        local phase_tail
+        phase_tail="$(tail -n 20 "$phase_log" 2>/dev/null || true)"
+        send_ntfy "[gpu-watch] Phase ${phase_num}/${total} FAILED: ${name} — ${RUN_NAME}" \
+            "Phase ${phase_num}/${total}: ${name} FAILED (exit ${phase_exit})
+Duration: ${phase_elapsed_fmt}
+
+Last output:
+${phase_tail}
+
+Run: ${RUN_NAME}" "high"
+    fi
+
+    return "$phase_exit"
+}
+
+# Run all phases sequentially; stops at the first failure.
+run_all_phases() {
+    local total=${#PHASE_CMDS[@]}
+    local overall_exit=0
+
+    echo "[gpu-watch] Running ${total} phase(s) sequentially: ${PHASE_NAMES[*]}"
+
+    for (( i=0; i<total; i++ )); do
+        if ! run_phase "$(( i+1 ))" "$total" "${PHASE_NAMES[$i]}" "${PHASE_CMDS[$i]}"; then
+            overall_exit=$?
+            echo "[gpu-watch] Stopping: phase $(( i+1 ))/${total} (${PHASE_NAMES[$i]}) failed."
+            break
+        fi
+    done
+
+    return "$overall_exit"
 }
 
 # ---------------------------------------------------------------------------
@@ -457,13 +662,24 @@ cleanup() {
         || date -r "$START_TIME" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
         || echo "N/A")"
 
+    local cmd_summary
+    if [[ ${#PHASE_CMDS[@]} -gt 0 ]]; then
+        local phase_lines=""
+        for (( _i=0; _i<${#PHASE_CMDS[@]}; _i++ )); do
+            phase_lines+="                   $(( _i+1 )). ${PHASE_NAMES[$_i]}: ${PHASE_CMDS[$_i]}"$'\n'
+        done
+        cmd_summary="(${#PHASE_CMDS[@]} phases)"$'\n'"${phase_lines}"
+    else
+        cmd_summary="${CMD[*]}"
+    fi
+
     cat > "${RUN_DIR}/summary.txt" <<EOF
 Run Name:          ${RUN_NAME}
 Start Time:        ${start_readable}
 End Time:          ${end_ts}
 Duration:          ${elapsed_fmt}
 Exit Code:         ${exit_code}
-Command:           ${CMD[*]}
+Command:           ${cmd_summary}
 Hostname:          $(hostname 2>/dev/null || echo "unknown")
 Working Directory: $(pwd)
 GPU Enabled:       ${GPU_ENABLED}
@@ -581,6 +797,12 @@ ${tail_lines}"
 # ---------------------------------------------------------------------------
 main() {
     parse_args "$@"
+
+    # Load phases file before validate_args so PHASE_CMDS is populated for checks
+    if [[ -n "$PHASES_FILE" ]]; then
+        load_phases_file "$PHASES_FILE"
+    fi
+
     validate_args
 
     if [[ -z "$RUN_NAME" ]]; then
@@ -634,7 +856,13 @@ main() {
         done
     } > "${RUN_DIR}/environment.txt"
 
-    echo "${CMD[*]}" > "${RUN_DIR}/command.txt"
+    if [[ ${#PHASE_CMDS[@]} -gt 0 ]]; then
+        for (( _i=0; _i<${#PHASE_CMDS[@]}; _i++ )); do
+            echo "Phase $(( _i+1 )) (${PHASE_NAMES[$_i]}): ${PHASE_CMDS[$_i]}"
+        done > "${RUN_DIR}/command.txt"
+    else
+        echo "${CMD[*]}" > "${RUN_DIR}/command.txt"
+    fi
 
     command -v nvidia-smi &>/dev/null && \
         nvidia-smi > "${RUN_DIR}/nvidia_smi_start.txt" 2>&1 || true
@@ -652,7 +880,23 @@ main() {
     # Start notification
     local gpu_start_info start_msg
     gpu_start_info="$(get_gpu_summary)"
-    start_msg="Run: ${RUN_NAME}
+
+    if [[ ${#PHASE_CMDS[@]} -gt 0 ]]; then
+        local phase_list=""
+        for (( _i=0; _i<${#PHASE_CMDS[@]}; _i++ )); do
+            phase_list+="$(( _i+1 )). ${PHASE_NAMES[$_i]}: ${PHASE_CMDS[$_i]}"$'\n'
+        done
+        start_msg="Run: ${RUN_NAME}
+Phases (${#PHASE_CMDS[@]}):
+${phase_list}
+Host: $(hostname 2>/dev/null || echo unknown)${POD_NAME:+ / pod=$POD_NAME}
+Dir: $(pwd)
+Logs: ${RUN_DIR}
+
+GPU:
+${gpu_start_info}"
+    else
+        start_msg="Run: ${RUN_NAME}
 Command: ${CMD[*]}
 Host: $(hostname 2>/dev/null || echo unknown)${POD_NAME:+ / pod=$POD_NAME}
 Dir: $(pwd)
@@ -660,11 +904,16 @@ Logs: ${RUN_DIR}
 
 GPU:
 ${gpu_start_info}"
+    fi
     send_ntfy "[gpu-watch] STARTED: ${RUN_NAME}" "$start_msg" "default"
 
     echo "[gpu-watch] Starting run: ${RUN_NAME}"
     echo "[gpu-watch] Logs: ${RUN_DIR}"
-    echo "[gpu-watch] Command: ${CMD[*]}"
+    if [[ ${#PHASE_CMDS[@]} -gt 0 ]]; then
+        echo "[gpu-watch] Phases (${#PHASE_CMDS[@]}): ${PHASE_NAMES[*]}"
+    else
+        echo "[gpu-watch] Command: ${CMD[*]}"
+    fi
     echo "[gpu-watch] GPU enabled: ${GPU_ENABLED} | Metrics enabled: ${METRICS_ENABLED}"
     echo "[gpu-watch] ntfy topic: ${TOPIC}"
     echo "---"
@@ -678,35 +927,49 @@ ${gpu_start_info}"
     status_loop &
     STATUS_LOOP_PID=$!
 
-    # ---------------------------------------------------------------------------
-    # Run the wrapped command
-    #
-    # Use a named FIFO so we can:
-    #   1. Track the real child PID (needed to forward SIGTERM in Kubernetes)
-    #   2. Capture the exact exit code with PIPESTATUS-free accounting
-    #   3. Stream output live to terminal AND log via tee
-    # ---------------------------------------------------------------------------
-    FIFO="${RUN_DIR}/.train_fifo"
-    mkfifo "$FIFO"
+    if [[ ${#PHASE_CMDS[@]} -gt 0 ]]; then
+        # -----------------------------------------------------------------
+        # Multi-phase mode
+        # Each phase manages its own FIFO/tee and updates TRAIN_LOG.
+        # -----------------------------------------------------------------
+        set +e
+        run_all_phases
+        EXIT_CODE=$?
+        set -e
 
-    # tee reads from the FIFO — writes to terminal and log simultaneously
-    tee -a "$TRAIN_LOG" < "$FIFO" &
-    TEE_PID=$!
+        # Point TRAIN_LOG at the combined log for the final cleanup summary
+        TRAIN_LOG="${RUN_DIR}/train.log"
+    else
+        # -----------------------------------------------------------------
+        # Single-command mode
+        #
+        # Use a named FIFO so we can:
+        #   1. Track the real child PID (needed to forward SIGTERM in Kubernetes)
+        #   2. Capture the exact exit code with PIPESTATUS-free accounting
+        #   3. Stream output live to terminal AND log via tee
+        # -----------------------------------------------------------------
+        FIFO="${RUN_DIR}/.train_fifo"
+        mkfifo "$FIFO"
 
-    set +e
-    "${CMD[@]}" > "$FIFO" 2>&1 &
-    CHILD_PID=$!
-    wait "$CHILD_PID"
-    EXIT_CODE=$?
-    set -e
+        # tee reads from the FIFO — writes to terminal and log simultaneously
+        tee -a "$TRAIN_LOG" < "$FIFO" &
+        TEE_PID=$!
 
-    CHILD_PID=""
+        set +e
+        "${CMD[@]}" > "$FIFO" 2>&1 &
+        CHILD_PID=$!
+        wait "$CHILD_PID"
+        EXIT_CODE=$?
+        set -e
 
-    # Close FIFO write end so tee sees EOF and exits
-    rm -f "$FIFO"
-    FIFO=""
-    wait "$TEE_PID" 2>/dev/null || true
-    TEE_PID=""
+        CHILD_PID=""
+
+        # Close FIFO write end so tee sees EOF and exits
+        rm -f "$FIFO"
+        FIFO=""
+        wait "$TEE_PID" 2>/dev/null || true
+        TEE_PID=""
+    fi
 
     stop_loops
 
