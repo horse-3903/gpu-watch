@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gpu-watch — interactive demo</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --border:    #30363d;
+      --text:      #c9d1d9;
+      --muted:     #8b949e;
+      --blue:      #58a6ff;
+      --green:     #3fb950;
+      --yellow:    #d29922;
+      --red:       #f85149;
+      --purple:    #bc8cff;
+      --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      --radius:    8px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 15px;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────────── */
+    header {
+      text-align: center;
+      padding: 56px 24px 40px;
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 {
+      font-size: 2.4rem;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      color: var(--blue);
+      letter-spacing: -1px;
+    }
+    header p {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 1rem;
+      max-width: 560px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .header-links {
+      margin-top: 20px;
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 16px;
+      border-radius: var(--radius);
+      font-size: 0.875rem;
+      font-weight: 500;
+      text-decoration: none;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .btn-primary {
+      background: var(--blue);
+      color: #0d1117;
+      border-color: var(--blue);
+    }
+    .btn-primary:hover { background: #79c0ff; border-color: #79c0ff; }
+    .btn-ghost {
+      background: transparent;
+      color: var(--text);
+    }
+    .btn-ghost:hover { background: var(--surface); }
+    .btn-green {
+      background: var(--green);
+      color: #0d1117;
+      border-color: var(--green);
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+    }
+    .btn-green:hover { background: #56d364; }
+    .btn-green:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn-sm {
+      padding: 5px 12px;
+      font-size: 0.8rem;
+    }
+
+    /* ── Layout ─────────────────────────────────────────────────────────── */
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 48px 24px 80px;
+      display: flex;
+      flex-direction: column;
+      gap: 56px;
+    }
+
+    section > h2 {
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 6px;
+    }
+    section > .section-desc {
+      color: var(--muted);
+      font-size: 0.875rem;
+      margin-bottom: 18px;
+    }
+
+    /* ── Terminal ────────────────────────────────────────────────────────── */
+    .terminal-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .terminal-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      background: #1c2128;
+    }
+    .dot { width: 12px; height: 12px; border-radius: 50%; }
+    .dot-red    { background: #ff5f57; }
+    .dot-yellow { background: #febc2e; }
+    .dot-green  { background: #28c840; }
+    .terminal-title {
+      font-size: 0.75rem;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      margin-left: 6px;
+    }
+    .terminal-controls {
+      margin-left: auto;
+      display: flex;
+      gap: 8px;
+    }
+    .terminal-body {
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      line-height: 1.55;
+      padding: 18px 20px;
+      min-height: 320px;
+      max-height: 480px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+    .terminal-body::-webkit-scrollbar { width: 6px; }
+    .terminal-body::-webkit-scrollbar-track { background: transparent; }
+    .terminal-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* terminal colour classes */
+    .t-prompt  { color: var(--green); }
+    .t-cmd     { color: var(--text); }
+    .t-gw      { color: var(--blue); }
+    .t-sep     { color: var(--muted); }
+    .t-epoch   { color: var(--text); }
+    .t-ok      { color: var(--green); }
+    .t-warn    { color: var(--yellow); }
+    .t-err     { color: var(--red); }
+    .t-dim     { color: var(--muted); }
+    .t-metric  { color: var(--purple); }
+    .t-cursor  {
+      display: inline-block;
+      width: 8px;
+      height: 14px;
+      background: var(--text);
+      vertical-align: text-bottom;
+      animation: blink 1s step-end infinite;
+      border-radius: 1px;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+    /* ── Split layout for demo + dir ────────────────────────────────────── */
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+      align-items: start;
+    }
+    @media (max-width: 720px) { .two-col { grid-template-columns: 1fr; } }
+
+    /* ── File tree ───────────────────────────────────────────────────────── */
+    .file-tree {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      line-height: 1.7;
+      padding: 16px 18px;
+      color: var(--muted);
+      opacity: 0.35;
+      transition: opacity 0.6s ease;
+      min-height: 320px;
+    }
+    .file-tree.revealed { opacity: 1; }
+    .file-tree .dir  { color: var(--blue); }
+    .file-tree .file { color: var(--text); }
+    .file-tree .ann  { color: var(--muted); font-style: italic; }
+    .file-tree .new  { color: var(--green); font-weight: 600; }
+
+    /* ── Metrics extractor ───────────────────────────────────────────────── */
+    .extractor-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      align-items: start;
+    }
+    @media (max-width: 720px) { .extractor-grid { grid-template-columns: 1fr; } }
+
+    .panel-label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 6px;
+    }
+    textarea {
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      line-height: 1.55;
+      padding: 12px 14px;
+      resize: vertical;
+      min-height: 220px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    textarea:focus { border-color: var(--blue); }
+    .extractor-output {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      line-height: 1.6;
+      padding: 12px 14px;
+      min-height: 220px;
+      color: var(--muted);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .extractor-output.has-result { color: var(--green); }
+    .extractor-output .src-line  { color: var(--muted); }
+    .extractor-output .kv        { color: var(--purple); }
+    .extractor-controls {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
+    .pyodide-status {
+      font-size: 0.75rem;
+      color: var(--muted);
+      font-family: var(--font-mono);
+    }
+    .pyodide-status.loading { color: var(--yellow); }
+    .pyodide-status.ready   { color: var(--green); }
+    .pyodide-status.error   { color: var(--red); }
+
+    /* ── Feature pills ───────────────────────────────────────────────────── */
+    .features {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .feature-pill {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 5px 14px;
+      font-size: 0.8rem;
+      color: var(--muted);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .feature-pill .icon { font-size: 0.9rem; }
+
+    /* ── Footer ──────────────────────────────────────────────────────────── */
+    footer {
+      text-align: center;
+      padding: 24px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+    footer a { color: var(--blue); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    /* ── Notification toast ──────────────────────────────────────────────── */
+    .toast-wrap {
+      position: relative;
+    }
+    .ntfy-toast {
+      display: none;
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: #1c2128;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 14px;
+      font-size: 0.75rem;
+      font-family: var(--font-mono);
+      max-width: 260px;
+      z-index: 10;
+      animation: slideIn 0.3s ease;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    .ntfy-toast.visible { display: block; }
+    .ntfy-toast-header {
+      font-weight: 700;
+      color: var(--green);
+      margin-bottom: 4px;
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .ntfy-toast-title { color: var(--blue); margin-bottom: 4px; font-weight: 600; }
+    .ntfy-toast-body  { color: var(--text); line-height: 1.4; }
+    @keyframes slideIn { from { opacity:0; transform:translateX(12px); } to { opacity:1; transform:none; } }
+  </style>
+</head>
+<body>
+
+<!-- ── Header ────────────────────────────────────────────────────────────── -->
+<header>
+  <h1>gpu-watch</h1>
+  <p>A lightweight CLI wrapper for long-running GPU jobs — persistent logs, GPU telemetry, metric extraction, and push notifications.</p>
+  <div class="header-links">
+    <a class="btn btn-primary" href="https://github.com/horse-3903/gpu-watch" target="_blank">
+      ★ GitHub
+    </a>
+    <a class="btn btn-ghost" href="https://github.com/horse-3903/gpu-watch#readme" target="_blank">
+      Docs
+    </a>
+  </div>
+</header>
+
+<!-- ── Main ──────────────────────────────────────────────────────────────── -->
+<main>
+
+  <!-- ── Terminal + run directory ─────────────────────────────────────────── -->
+  <section>
+    <h2>Live demo</h2>
+    <p class="section-desc">Animated replay of a real gpu-watch session wrapping a dummy training script. No GPU required.</p>
+
+    <div class="two-col">
+      <!-- Terminal -->
+      <div>
+        <div class="toast-wrap">
+          <div class="terminal-wrap">
+            <div class="terminal-bar">
+              <span class="dot dot-red"></span>
+              <span class="dot dot-yellow"></span>
+              <span class="dot dot-green"></span>
+              <span class="terminal-title">bash — gpu-watch demo</span>
+              <div class="terminal-controls">
+                <button class="btn btn-green btn-sm" id="runBtn" onclick="startDemo()">▶ Run</button>
+              </div>
+            </div>
+            <div class="terminal-body" id="termBody"><span class="t-dim">Press ▶ Run to start the demo.</span><span class="t-cursor"></span></div>
+          </div>
+          <!-- ntfy toast -->
+          <div class="ntfy-toast" id="ntfyToast">
+            <div class="ntfy-toast-header">ntfy.sh notification</div>
+            <div class="ntfy-toast-title" id="ntfyTitle"></div>
+            <div class="ntfy-toast-body"  id="ntfyBody"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Run directory -->
+      <div>
+        <div class="panel-label">Generated run directory</div>
+        <div class="file-tree" id="fileTree">
+<span class="dir">logs/</span>
+  <span class="dir">└── demo-run_20260607_143210/</span>
+      <span class="file">    ├── train.log</span>          <span class="ann">← full stdout + stderr</span>
+      <span class="file">    ├── gpu.log</span>            <span class="ann">← nvidia-smi snapshots</span>
+      <span class="file">    ├── metrics.log</span>        <span class="ann">← periodic metrics</span>
+      <span class="file">    ├── summary.txt</span>        <span class="ann">← run metadata</span>
+      <span class="file">    ├── exit_code.txt</span>
+      <span class="file">    ├── command.txt</span>
+      <span class="file">    ├── environment.txt</span>    <span class="ann">← hostname, CUDA vars</span>
+      <span class="file">    ├── pip_freeze.txt</span>
+      <span class="file">    ├── nvidia_smi_start.txt</span>
+      <span class="file">    └── nvidia_smi_end.txt</span>
+        </div>
+        <p style="font-size:0.75rem; color:var(--muted); margin-top:10px;">
+          Every run gets its own timestamped directory. Logs persist after the terminal session ends.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Metrics extractor ─────────────────────────────────────────────── -->
+  <section>
+    <h2>Live metric extractor</h2>
+    <p class="section-desc">
+      Paste any training log below — the metric extraction logic from
+      <code style="font-family:var(--font-mono);font-size:0.8em;color:var(--blue)">gpu_watch_metrics.py</code>
+      runs directly in your browser via Pyodide (Python compiled to WebAssembly). No server involved.
+    </p>
+
+    <div class="extractor-grid">
+      <div>
+        <div class="panel-label">Training log (paste yours or use the sample)</div>
+        <textarea id="logInput" spellcheck="false">Starting dummy training: 15 steps
+Model: dummy-net  |  Dataset: fake-data  |  Device: cpu
+
+Epoch  1/15 | loss=1.4093 | accuracy=0.3594 | lr=0.000950
+Epoch  2/15 | loss=1.0821 | accuracy=0.5081 | lr=0.000902
+Epoch  3/15 | loss=0.8934 | accuracy=0.5939 | lr=0.000857
+Epoch  4/15 | loss=0.7123 | accuracy=0.6759 | lr=0.000815
+Epoch  5/15 | loss=0.5621 | accuracy=0.7445 | lr=0.000774
+Epoch  6/15 | loss=0.4312 | accuracy=0.8039 | lr=0.000735
+Epoch  7/15 | loss=0.3401 | accuracy=0.8453 | lr=0.000698
+Epoch  8/15 | loss=0.2641 | accuracy=0.8800 | lr=0.000663
+Epoch  9/15 | loss=0.2134 | accuracy=0.9030 | lr=0.000630
+Epoch 10/15 | loss=0.1723 | accuracy=0.9217 | lr=0.000599
+Epoch 11/15 | loss=0.1421 | accuracy=0.9354 | lr=0.000569
+Epoch 12/15 | loss=0.1189 | accuracy=0.9460 | lr=0.000541
+Epoch 13/15 | loss=0.1002 | accuracy=0.9544 | lr=0.000514
+Epoch 14/15 | loss=0.0891 | accuracy=0.9595 | lr=0.000488
+Epoch 15/15 | loss=0.0812 | accuracy=0.9631 | lr=0.000464
+
+Training complete.
+Final loss=0.0812 | Final accuracy=0.9631</textarea>
+
+        <div class="extractor-controls">
+          <button class="btn btn-green" id="loadPyodideBtn" onclick="loadPyodideEngine()">Load Python engine</button>
+          <button class="btn btn-ghost btn-sm" id="extractBtn" onclick="extractMetrics()" disabled>Extract metrics</button>
+          <span class="pyodide-status" id="pyodideStatus">not loaded</span>
+        </div>
+      </div>
+
+      <div>
+        <div class="panel-label">Parsed output</div>
+        <div class="extractor-output" id="extractorOutput">Waiting for extraction…
+
+The metric extractor tries four sources in order:
+  1. TensorBoard event files
+  2. CSV files (Ultralytics, HuggingFace)
+  3. JSON / JSONL files
+  4. stdout regex  ← used for this demo
+
+Results are ranked by a priority list
+(epoch → val metrics → mAP → loss → lr)
+and truncated to the top-k keys.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Features ────────────────────────────────────────────────────────── -->
+  <section>
+    <h2>What it does</h2>
+    <p class="section-desc">Works with any training command. No code instrumentation required.</p>
+    <div class="features">
+      <span class="feature-pill"><span class="icon">📁</span> Persistent timestamped run directories</span>
+      <span class="feature-pill"><span class="icon">📝</span> Live log streaming via FIFO + tee</span>
+      <span class="feature-pill"><span class="icon">📊</span> GPU telemetry via nvidia-smi</span>
+      <span class="feature-pill"><span class="icon">📈</span> Multi-source metric extraction</span>
+      <span class="feature-pill"><span class="icon">🔔</span> ntfy.sh push notifications</span>
+      <span class="feature-pill"><span class="icon">🔢</span> Exit code propagation</span>
+      <span class="feature-pill"><span class="icon">⚡</span> SIGINT + SIGTERM handling</span>
+      <span class="feature-pill"><span class="icon">🔄</span> Multi-phase sequential training</span>
+      <span class="feature-pill"><span class="icon">🌐</span> Kubernetes-aware</span>
+      <span class="feature-pill"><span class="icon">🖥️</span> Works on RunPod, cloud VMs, local</span>
+    </div>
+
+    <div style="margin-top:24px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:16px 18px;">
+      <div class="panel-label" style="margin-bottom:10px;">Quick install (Debian/Ubuntu)</div>
+      <code style="font-family:var(--font-mono); font-size:0.8rem; color:var(--text); display:block; line-height:1.8;">
+<span style="color:var(--muted)"># clone and install</span>
+git clone https://github.com/horse-3903/gpu-watch.git<br>
+cd gpu-watch<br>
+sudo make install<br>
+<br>
+<span style="color:var(--muted)"># wrap any training command</span>
+gpu-watch --topic my-topic -- python train.py
+      </code>
+    </div>
+  </section>
+
+</main>
+
+<!-- ── Footer ────────────────────────────────────────────────────────────── -->
+<footer>
+  <a href="https://github.com/horse-3903/gpu-watch">horse-3903/gpu-watch</a>
+  &nbsp;·&nbsp; MIT License
+  &nbsp;·&nbsp; The terminal replay is a simulation; the metric extractor runs real Python via Pyodide.
+</footer>
+
+<!-- ── Scripts ───────────────────────────────────────────────────────────── -->
+<script>
+// ── Terminal replay ────────────────────────────────────────────────────────
+
+const LINES = [
+  { text: '$ gpu-watch --topic demo-topic --no-gpu \\',          cls: ['t-prompt'], delay: 0 },
+  { text: '      --name demo-run -- python dummy_train.py --steps 15', cls: ['t-dim'], delay: 40 },
+  { text: '',                                                     cls: [],            delay: 80 },
+  { text: '[gpu-watch] Starting run: demo-run',                   cls: ['t-gw'],      delay: 120 },
+  { text: '[gpu-watch] Logs: logs/demo-run_20260607_143210',      cls: ['t-gw'],      delay: 60 },
+  { text: '[gpu-watch] Command: python dummy_train.py --steps 15',cls: ['t-gw'],      delay: 60 },
+  { text: '[gpu-watch] GPU enabled: false | Metrics enabled: true',cls:['t-gw'],      delay: 60 },
+  { text: '[gpu-watch] ntfy topic: demo-topic',                   cls: ['t-gw'],      delay: 60 },
+  { text: '---',                                                  cls: ['t-sep'],     delay: 80,
+    onShow: () => showToast('[gpu-watch] STARTED: demo-run',
+      'Command: python dummy_train.py --steps 15\nHost: gpu-node-01\nLogs: logs/demo-run_20260607_143210') },
+  { text: 'Starting dummy training: 15 steps, delay=0.5s',       cls: [],            delay: 120 },
+  { text: 'Model: dummy-net  |  Dataset: fake-data  |  Device: cpu', cls: ['t-dim'], delay: 60 },
+  { text: '',                                                     cls: [],            delay: 60 },
+  { text: 'Epoch  1/15 | loss=1.4093 | accuracy=0.3594 | lr=0.000950', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch  2/15 | loss=1.0821 | accuracy=0.5081 | lr=0.000902', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch  3/15 | loss=0.8934 | accuracy=0.5939 | lr=0.000857', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch  4/15 | loss=0.7123 | accuracy=0.6759 | lr=0.000815', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch  5/15 | loss=0.5621 | accuracy=0.7445 | lr=0.000774', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch  6/15 | loss=0.4312 | accuracy=0.8039 | lr=0.000735', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch  7/15 | loss=0.3401 | accuracy=0.8453 | lr=0.000698', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch  8/15 | loss=0.2641 | accuracy=0.8800 | lr=0.000663', cls: ['t-epoch'], delay: 340,
+    onShow: () => showToast('[gpu-watch] demo-run still running',
+      'Elapsed: 00h 00m 05s\n\nMetrics:\nsource=log\nepoch=8  loss=0.2641  accuracy=0.88') },
+  { text: 'Epoch  9/15 | loss=0.2134 | accuracy=0.9030 | lr=0.000630', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch 10/15 | loss=0.1723 | accuracy=0.9217 | lr=0.000599', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch 11/15 | loss=0.1421 | accuracy=0.9354 | lr=0.000569', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch 12/15 | loss=0.1189 | accuracy=0.9460 | lr=0.000541', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch 13/15 | loss=0.1002 | accuracy=0.9544 | lr=0.000514', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch 14/15 | loss=0.0891 | accuracy=0.9595 | lr=0.000488', cls: ['t-epoch'], delay: 340 },
+  { text: 'Epoch 15/15 | loss=0.0812 | accuracy=0.9631 | lr=0.000464', cls: ['t-epoch'], delay: 340 },
+  { text: '',                                                     cls: [],            delay: 60 },
+  { text: 'Training complete.',                                   cls: ['t-ok'],      delay: 80 },
+  { text: 'Final loss=0.0812 | Final accuracy=0.9631',           cls: ['t-metric'],  delay: 80 },
+  { text: '[gpu-watch] Run complete. Duration: 00h 00m 12s | Exit: 0 | Logs: logs/demo-run_20260607_143210',
+    cls: ['t-gw', 't-ok'], delay: 160,
+    onShow: () => {
+      showToast('[gpu-watch] SUCCESS: demo-run',
+        'Duration: 00h 00m 12s\nExit code: 0\n\nFinal metrics:\nepoch=15  loss=0.0812  accuracy=0.9631');
+      revealTree();
+    }
+  },
+];
+
+let demoRunning = false;
+let demoTimeouts = [];
+
+function startDemo() {
+  if (demoRunning) return;
+  demoRunning = true;
+
+  const btn = document.getElementById('runBtn');
+  btn.disabled = true;
+  btn.textContent = '● Running';
+
+  const body = document.getElementById('termBody');
+  body.innerHTML = '';
+
+  hideToast();
+  document.getElementById('fileTree').classList.remove('revealed');
+
+  let elapsed = 0;
+  LINES.forEach((line, i) => {
+    elapsed += line.delay || 0;
+    const tid = setTimeout(() => {
+      appendLine(body, line.text, line.cls || []);
+      if (line.onShow) line.onShow();
+      if (i === LINES.length - 1) {
+        // done
+        demoRunning = false;
+        btn.disabled = false;
+        btn.textContent = '↺ Replay';
+      }
+    }, elapsed);
+    demoTimeouts.push(tid);
+  });
+}
+
+function appendLine(container, text, classes) {
+  const span = document.createElement('span');
+  span.className = classes.join(' ');
+  span.textContent = text + '\n';
+  container.appendChild(span);
+  container.scrollTop = container.scrollHeight;
+}
+
+function revealTree() {
+  document.getElementById('fileTree').classList.add('revealed');
+}
+
+// ── ntfy toast ─────────────────────────────────────────────────────────────
+
+let toastTimeout = null;
+
+function showToast(title, body) {
+  clearTimeout(toastTimeout);
+  document.getElementById('ntfyTitle').textContent = title;
+  document.getElementById('ntfyBody').textContent = body;
+  document.getElementById('ntfyToast').classList.add('visible');
+  toastTimeout = setTimeout(hideToast, 4000);
+}
+
+function hideToast() {
+  document.getElementById('ntfyToast').classList.remove('visible');
+}
+
+// ── Pyodide metrics extractor ─────────────────────────────────────────────
+
+let pyodide = null;
+let pyodideReady = false;
+
+const PYTHON_CODE = `
+import re
+
+PRIORITY_KEYS = [
+    "epoch", "step", "global_step",
+    "val/loss", "val_loss", "eval/loss", "eval_loss",
+    "val/accuracy", "val_acc",
+    "mAP50-95", "mAP50", "mAP", "map50",
+    "f1", "accuracy", "acc", "precision", "recall",
+    "loss", "train/loss", "train_loss",
+    "lr", "learning_rate",
+]
+
+SKIP_RE = re.compile(
+    r"(timestamp|time|date|pid|epoch_time|step_time|"
+    r"samples_per_sec|throughput|speed|it_per_sec|ms_per_step)",
+    re.IGNORECASE,
+)
+
+LOG_METRIC_RE = re.compile(
+    r"(?:^|[\\s,|])([A-Za-z][A-Za-z0-9_/\\-.]*)"
+    r"\\s*[=:]\\s*([0-9]+(?:\\.[0-9]+)?(?:e[+\\-]?[0-9]+)?)",
+    re.IGNORECASE,
+)
+EPOCH_RE = re.compile(r"[Ee]poch\\s+(\\d+)(?:/(\\d+))?")
+
+def _priority_idx(key):
+    kl = key.lower().strip()
+    for i, pk in enumerate(PRIORITY_KEYS):
+        if pk.lower() == kl:      return float(i)
+        if pk.lower() in kl:      return i + 0.5
+    return float(len(PRIORITY_KEYS))
+
+def extract(log_text, top_k=8):
+    lines = log_text.strip().split("\\n")
+    tail  = lines[-500:]
+    metrics = {}
+    for line in reversed(tail):
+        m = EPOCH_RE.search(line)
+        if m and "epoch" not in metrics:
+            metrics["epoch"] = int(m.group(1))
+        for match in LOG_METRIC_RE.finditer(line):
+            k = match.group(1).strip()
+            v = match.group(2).strip()
+            if not k or SKIP_RE.search(k):
+                continue
+            try:
+                metrics.setdefault(k, float(v))
+            except ValueError:
+                pass
+        if len(metrics) >= top_k * 3:
+            break
+    if not metrics:
+        return None, {}
+    ranked = sorted(metrics.items(), key=lambda kv: _priority_idx(kv[0]))[:top_k]
+    return "source=log (stdout regex)", dict(ranked)
+
+def fmt(v):
+    if isinstance(v, float):
+        if abs(v) < 0.001 or abs(v) >= 10000:
+            return f"{v:.4e}"
+        return f"{v:.4f}".rstrip("0").rstrip(".")
+    return str(v)
+
+def run(log_text):
+    src, metrics = extract(log_text)
+    if src is None:
+        return "No metrics found in log."
+    lines = [src]
+    lines.append("")
+    for k, v in metrics.items():
+        lines.append(f"  {k} = {fmt(v)}")
+    return "\\n".join(lines)
+`;
+
+async function loadPyodideEngine() {
+  const btn = document.getElementById('loadPyodideBtn');
+  const status = document.getElementById('pyodideStatus');
+
+  btn.disabled = true;
+  status.className = 'pyodide-status loading';
+  status.textContent = 'loading Python engine (~7 MB)…';
+
+  try {
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js';
+    document.head.appendChild(script);
+    await new Promise((res, rej) => { script.onload = res; script.onerror = rej; });
+
+    pyodide = await loadPyodide();
+    await pyodide.runPythonAsync(PYTHON_CODE);
+
+    pyodideReady = true;
+    status.className = 'pyodide-status ready';
+    status.textContent = 'Python ready';
+    document.getElementById('extractBtn').disabled = false;
+    btn.style.display = 'none';
+  } catch (e) {
+    status.className = 'pyodide-status error';
+    status.textContent = 'load failed — check console';
+    btn.disabled = false;
+    console.error(e);
+  }
+}
+
+async function extractMetrics() {
+  if (!pyodideReady) return;
+  const log = document.getElementById('logInput').value;
+  const out = document.getElementById('extractorOutput');
+  out.className = 'extractor-output';
+  out.textContent = 'Extracting…';
+
+  try {
+    const result = await pyodide.runPythonAsync(`run(${JSON.stringify(log)})`);
+    out.className = 'extractor-output has-result';
+
+    // Colour the output
+    const lines = result.split('\n');
+    out.innerHTML = '';
+    lines.forEach((line, i) => {
+      const el = document.createElement('div');
+      if (i === 0) {
+        el.className = 'src-line';
+      } else if (line.includes(' = ')) {
+        el.className = 'kv';
+      }
+      el.textContent = line;
+      out.appendChild(el);
+    });
+  } catch (e) {
+    out.className = 'extractor-output';
+    out.textContent = 'Error: ' + e.message;
+    console.error(e);
+  }
+}
+</script>
+
+</body>
+</html>

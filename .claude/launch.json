@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gpu-watch-demo",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "3721", "--directory", "demo"],
+      "port": 3721
+    }
+  ]
+}
