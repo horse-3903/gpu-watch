@@ -10,6 +10,8 @@ A lightweight CLI wrapper for long-running GPU jobs with persistent logs, GPU te
 [![License](https://img.shields.io/github/license/horse-3903/gpu-watch?style=flat-square)](LICENSE)
 [![Last Commit](https://img.shields.io/github/last-commit/horse-3903/gpu-watch?style=flat-square)](../../commits)
 
+**[Live demo →](https://horse-3903.github.io/gpu-watch/)**
+
 </div>
 
 ---
